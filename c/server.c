@@ -1,9 +1,9 @@
 /*
- * Sample implementation of SSE-Server according to criterias specified by 
+ * Example implementation of SSE-Server according to criterias specified by
  * https://github.com/rexxars/sse-broadcast-benchmark
  *
  * Written by Ole Fredrik Skudsvik <oles@vg.no>, Dec 2014
- * 
+ *
  * */
 
 #include <stdio.h>
@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <fcntl.h>
@@ -23,10 +24,10 @@
 
 /* Defaults. */
 #define LISTEN_PORT 1942
-#define NUM_THREADS 8
+#define NUM_THREADS 4
 #define LOGLEVEL LOG_INFO
 
-#define MAXEVENTS 600
+#define MAXEVENTS 1024
 
 #define HTTP_200 "HTTP/1.1 200 OK\r\n"
 #define HTTP_204 "HTTP/1.1 204 No Content\r\n"
@@ -62,8 +63,11 @@ typedef enum  {
 
 int efd;
 struct epoll_event *events;
+
 ssethread_t **threadpool;
 pthread_t t_main;
+
+pthread_mutex_t logmutex;
 
 void writelog(loglevel_t level, const char* fmt, ...) {
   va_list arglist;
@@ -79,11 +83,13 @@ void writelog(loglevel_t level, const char* fmt, ...) {
   asctime_r(&result, stime);
   stime[strlen(stime)-1] = '\0';
 
+  pthread_mutex_lock(&logmutex);
   va_start(arglist, fmt);
   printf("%s ", stime);
   vprintf(fmt, arglist);
   printf("\n");
   va_end(arglist);
+  pthread_mutex_unlock(&logmutex);
 }
 
 int writesock(int fd, const char* fmt, ...) {
@@ -100,18 +106,16 @@ int writesock(int fd, const char* fmt, ...) {
 /*
  * Simple parser to extract uri from GET requests.
  * */
-int get_uri(char* str, char *dst, int bufsiz) {
-  int i, len; 
-  
-  len = strlen(str);
-  memset(dst, '\0', bufsiz);
+int get_uri(char* str, int len, char *dst, int bufsiz) {
+  int i;
 
   if (strncmp("GET ", str, 4) == 0) {
     for(i=4; i < len && str[i] != ' ' && i < bufsiz; i++) {
       *dst++ = str[i];
     }
-    *(dst+1) = '\0';
+    *(dst) = '\0';
     dst -= i;
+
     return 1;
   }
 
@@ -133,44 +137,41 @@ int getnumclients() {
  * SSE channel handler.
  */
 void *sse_thread(void* _this) {
- int t_maxevents, t_id, n, i, ret;
+ int t_maxevents, n, i;
  struct epoll_event *t_events, t_event;
  struct timeval tv;
- ssethread_t* this = (ssethread_t*)_this; 
+ ssethread_t* this = (ssethread_t*)_this;
 
  t_maxevents = sysconf(_SC_OPEN_MAX) / NUM_THREADS;
  t_events = calloc(t_maxevents, sizeof(t_event));
  this->numclients = 0;
 
  while(1) {
-   n = epoll_wait(this->epollfd, t_events, t_maxevents, -1);
+   n = epoll_wait(this->epollfd, t_events, t_maxevents, 0);
    gettimeofday(&tv, NULL);
 
    for (i = 0; i < n; i++) {
-    if ((t_events[i].events & EPOLLHUP)) {
-      writelog(LOG_DEBUG, "sse_thread #%i: Client disconnected.", this->id);
-      close(t_events[i].data.fd);
-      this->numclients--;
-      continue;
-    }
+     if ((t_events[i].events & EPOLLHUP) || (t_events[i].events & EPOLLRDHUP)) {
+       writelog(LOG_DEBUG, "sse_thread #%i: Client disconnected.", this->id);
+       close(t_events[i].data.fd);
+       this->numclients--;
+       continue;
+     }
 
-     /* Close socket if an error occours. */
-    if ((t_events[i].events & EPOLLERR)) {
-      writelog(LOG_ERROR, "sse_thread(): Error occoured on socket: %s (errno: %i).", strerror(errno), errno);
-      close (t_events[i].data.fd);
-      this->numclients--;
-      continue;
-    }
+     if (t_events[i].events & EPOLLERR) {
+       writelog(LOG_ERROR, "sse_thread #%i: Socket error: %s.", this->id, strerror(errno));
+       continue;
+     }
 
-    ret = writesock(t_events[i].data.fd, "data: %ld\n\n", tv.tv_sec*1000LL + tv.tv_usec/1000);
+     writesock(t_events[i].data.fd, "data: %ld\n\n", tv.tv_sec*1000LL + tv.tv_usec/1000);
    }
 
-   sleep(1); 
- }
-
+   if (i > 0)  writelog(LOG_DEBUG, "Thread #%i: broadcasted to %i clients.", this->id, i);
+   sleep(1);
+  }
 }
 
-/* 
+/*
  * Main handler.
  * */
 void *main_thread() {
@@ -179,51 +180,53 @@ void *main_thread() {
   struct epoll_event event;
 
   cur_thread = 0;
-  
+
   while(1) {
     n = epoll_wait(efd, events, MAXEVENTS, -1);
 
     for (i = 0; i < n; i++) {
-      /* Close socket if an error occours. */
-      if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) || (!(events[i].events & EPOLLIN))) {
-        writelog(LOG_DEBUG, "main_thread(): Error occoured while reading data from socket."); 
-        close (events[i].data.fd);
+      if ((events[i].events & EPOLLHUP) || (events[i].events & EPOLLRDHUP)) {
+        close(events[i].data.fd);
+         continue;
+      }
+
+      if ((events[i].events & EPOLLERR) || (!(events[i].events & EPOLLIN))) {
+        writelog(LOG_DEBUG, "main_thread(): Error occurred while reading data from socket.");
         continue;
       }
 
-      memset(buf, '\0', 512);
-
       /* Read from client. */
       len = read(events[i].data.fd, &buf, 512);
-    
-      /* FIXME: Return only on /connections and /sse */ 
+      buf[len] = '\0';
+
       if (strncmp(buf, "OPTIONS", 7) == 0) {
           writesock(events[i].data.fd, "%s%s", HTTP_204, RESPONSE_OPTIONS_CORS);
+          close(events[i].data.fd);
           continue;
-      } 
-  
-      if (get_uri(buf, uri, 64)) {
+      }
+
+      if (get_uri(buf, len, uri, 64)) {
         writelog(LOG_DEBUG, "GET %s.", uri);
-      
-        if (strncmp(uri, "/connections\0", 13) == 0) { // Handle /connections.
-          writesock(events[i].data.fd, "%s%s%i\n", HTTP_200, RESPONSE_HEADER_PLAIN, getnumclients());
-        } else if (strncmp(uri, "/sse\0", 4) == 0) { // Handle SSE channel.
+
+        if (strcmp(uri, "/connections") == 0) { // Handle /connections.
+          writesock(events[i].data.fd, "%s%s%i", HTTP_200, RESPONSE_HEADER_PLAIN, getnumclients());
+        } else if (strcmp(uri, "/sse") == 0) { // Handle SSE channel.
           writesock(events[i].data.fd, "%s%s:ok\n\n", HTTP_200, RESPONSE_HEADER_STREAM, uri);
 
            /* Add client to the epoll eventlist. */
           event.data.fd = events[i].data.fd;
           event.events = EPOLLOUT;
-   
+
           ret = epoll_ctl(threadpool[cur_thread]->epollfd, EPOLL_CTL_ADD, events[i].data.fd, &event);
           if (ret == -1) {
-            writelog(LOG_DEBUG, "main_thread: Could not add client to epoll eventlist (curthread: %i): %s.", cur_thread, strerror(errno));
+            writelog(LOG_ERROR, "main_thread: Could not add client to epoll eventlist (curthread: %i): %s.", cur_thread, strerror(errno));
             close(events[i].data.fd);
             continue;
           }
 
           /* Remove fd from main efd set. */
           epoll_ctl(efd, EPOLL_CTL_DEL, events[i].data.fd, NULL);
-          
+
           /* Increment numclients and cur_thread. */
           threadpool[cur_thread]->numclients++;
           cur_thread = (cur_thread == NUM_THREADS-1) ? 0 : (cur_thread+1);
@@ -232,40 +235,39 @@ void *main_thread() {
         } else { // Return 404 on everything else.
           writesock(events[i].data.fd, "%s%sNo such channel.\r\n", HTTP_404, RESPONSE_HEADER_PLAIN);
         }
-      } 
+      }
 
-      close (events[i].data.fd);
+      close(events[i].data.fd);
     }
   }
 }
 
 void cleanup() {
   int i;
-  for (i = 0; i<NUM_THREADS; free(threadpool[i]), close(threadpool[i]->epollfd));
+  for (i = 0; i<NUM_THREADS; close(threadpool[i]->epollfd), free(threadpool[i]));
   free(threadpool);
   free(events);
 }
 
-int main(int argc, char **argv[]) {
-  int serversock, ret, on, thread_id, i;
+int main(int argc, char *argv[]) {
+  int serversock, ret, on, tmpfd, i;
   struct sockaddr_in sin;
-  struct epoll_event event;
 
   on = 1;
 
   /* Ignore SIGPIPE. */
-  signal(SIGPIPE, SIG_IGN); 
-   
+  signal(SIGPIPE, SIG_IGN);
+
 
   /* Set up listening socket. */
-  serversock = socket(AF_INET, SOCK_STREAM, 0); 
+  serversock = socket(AF_INET, SOCK_STREAM, 0);
   if (serversock == -1) {
-    perror("Creating socket");
+    writelog(LOG_ERROR, "Creating socket: %s.", strerror(errno));
     exit(1);
   }
 
   setsockopt(serversock, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
-  
+
   memset((char*)&sin, '\0', sizeof(sin));
   sin.sin_family  = AF_INET;
   sin.sin_port  = htons(LISTEN_PORT);
@@ -305,7 +307,7 @@ int main(int argc, char **argv[]) {
 
     pthread_create(&threadpool[i]->thread, NULL, sse_thread, threadpool[i]);
    }
-  
+
   /* Set up epoll stuff. */
   efd = epoll_create1(0);
   if (efd == -1) {
@@ -313,20 +315,19 @@ int main(int argc, char **argv[]) {
     exit(1);
   }
 
-  events = calloc(MAXEVENTS, sizeof(event)); 
+  events = calloc(MAXEVENTS, sizeof(struct epoll_event));
 
   /* Mainloop, clients will be accepted here. */
   while(1) {
-    struct sockaddr_in csin;
-    int clen, tmpfd, ret;
-    char ip[32];
+    struct sockaddr csin;
+    socklen_t clen;
+    struct epoll_event event;
 
-    memset((char*)&csin, '\0', sizeof(csin));
     clen = sizeof(csin);
 
-    // Accept the connection.
+    /* Accept the connection. */
     tmpfd = accept(serversock, (struct sockaddr*)&csin, &clen);
-   
+
     /* Got an error ? Handle it. */
     if (tmpfd == -1) {
       switch (errno) {
@@ -340,25 +341,24 @@ int main(int argc, char **argv[]) {
       }
 
       continue; /* Try again. */
-    } 
+    }
 
     /* If we got this far we've accepted the connection */
-    fcntl(tmpfd, F_SETFL, O_NONBLOCK); // Set non-blocking on the clientsocket.
+    fcntl(tmpfd, F_SETFL, O_RDWR | O_NONBLOCK); // Set non-blocking on the clientsocket.
 
     /* Add client to the epoll eventlist. */
     event.data.fd = tmpfd;
-    event.events = EPOLLIN | EPOLLET;
-   
+    event.events = EPOLLIN; // | EPOLLONESHOT;
+
     ret = epoll_ctl(efd, EPOLL_CTL_ADD, tmpfd, &event);
     if (ret == -1) {
-      writelog(LOG_DEBUG, "Could not add client to epoll eventlist: %s.", strerror(errno));
+      writelog(LOG_ERROR, "Could not add client to epoll eventlist: %s.", strerror(errno));
       close(tmpfd);
       continue;
     }
 
-    inet_ntop(AF_INET, &csin.sin_addr, &ip, 32);
-    writelog(LOG_DEBUG, "Accepted new connection from %s.", ip);
- }
+    writelog(LOG_DEBUG, "Accepted new connection.");
+}
 
   cleanup();
   return(0);
